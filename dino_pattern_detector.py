@@ -7,14 +7,21 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFilter
 from torchvision import transforms
-from utils import save_heatmap, crop_to_foreground, turn_to_binary, fit_to_patch_grid, resize_with_scale
+from utils import save_heatmap, crop_to_foreground, turn_to_binary, fit_to_patch_grid, find_roi, resize_with_scale
 import matplotlib.pyplot as plt
 import math
+import time
 
 # If grid size is too small, the feature map cant represent pattern well.
 # e.g. a square image should be in 126x126 so that its grid size is 9x9.
 # this number is founded by empirical tests
-MIN_GRID_SIZE = 7
+MIN_GRID_SIZE = 5
+TOKEN_MASK_METHOD = "v2" # v1: any foreground pixel in patch, v2: resize + threshold
+TEST_PATTERN_NO = 1
+DEVICE = "cuda"
+_SCALE_LIST = [1.5]# [x / 10 for x in range(5, 21)] #[1.7, 2.0] # for MIN_GRID_SIZE=5 #can add 2.8, but will take more time
+
+SCALE_LIST = [x*MIN_GRID_SIZE / 5 for x in _SCALE_LIST]
 
 class ImageWrapper:
     """
@@ -65,8 +72,13 @@ class ImageWrapper:
         self.resize_option = resize_option
         self.threshold = threshold
 
-    def get_token_mask(self) -> torch.Tensor:
-        arr = np.array(self.binary) > 0  # shape: [H, W]
+        if TOKEN_MASK_METHOD == "v1":
+            self.get_token_mask = self.get_token_mask_v1
+        else:
+            self.get_token_mask = self.get_token_mask_v2
+
+    def get_token_mask_v1(self) -> torch.Tensor:
+        arr = np.array(self.binary) == 0  # shape: [H, W]
 
         grid_h, grid_w = self.grid_size[::-1]
 
@@ -76,6 +88,15 @@ class ImageWrapper:
         ).any(axis=(1, 3)) # a token is true if any pixel in its patch is foreground
 
         return torch.from_numpy(token_mask).bool()
+    
+    def get_token_mask_v2(self) -> torch.Tensor:
+        resized_image = self.binary.resize(self.grid_size, resample=Image.Resampling.BICUBIC)
+        resized_image = turn_to_binary(resized_image, threshold=self.threshold)
+        mask_binary = np.array(resized_image) == 0 # black is True, white is False, shape [h,w]
+        return torch.from_numpy(mask_binary).bool()
+    
+    def get_token_mask(self) -> torch.Tensor:
+        return self.get_token_mask_v1() if TOKEN_MASK_METHOD == "v1" else self.get_token_mask_v2()
 
 
 class DinoPatternDetector:
@@ -116,6 +137,7 @@ class DinoPatternDetector:
             image_batch = image_tensor.unsqueeze(0).to(self.device)
             tokens = self.model.get_intermediate_layers(image_batch)[0].squeeze()
             features = tokens.reshape(grid_h, grid_w, -1).contiguous() # tensor so [h,w]
+            print(f"Tokens shape: {tokens.shape}, Features shape: {features.shape}")
         
         return features.to(self.device)
 
@@ -123,7 +145,6 @@ class DinoPatternDetector:
         self,
         drawing_features: torch.Tensor,
         query_features: torch.Tensor,
-        drawing_mask: torch.Tensor,
         query_mask: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         """
@@ -154,7 +175,6 @@ class DinoPatternDetector:
 
         # 1 x 1 x qH x qW
         mask = query_mask.float().unsqueeze(0).unsqueeze(0)
-        d_mask = drawing_mask.float().unsqueeze(0).unsqueeze(0)
 
         # Conv2D kernel: 1 x D x qH x qW
         kernel = query_feat * mask
@@ -162,7 +182,7 @@ class DinoPatternDetector:
         denom = mask.sum().clamp(min=1.0)
 
         # 1 x 1 x outH x outW
-        heatmap = F.conv2d(drawing * d_mask, kernel) / denom
+        heatmap = F.conv2d(drawing, kernel) / denom
 
         return heatmap.squeeze(0).squeeze(0)
 
@@ -202,7 +222,7 @@ class DinoPatternDetector:
             padding=peak_kernel_size // 2,
         ).squeeze(0).squeeze(0)
 
-        peaks = (hm >= pooled - 1e-6) & (hm >= threshold)
+        peaks = (hm >= pooled - 1e-6) & (hm >= threshold) # find local maximum and above threshold
 
         ys, xs = torch.where(peaks)
 
@@ -306,7 +326,6 @@ class DinoPatternDetector:
             detect boxes in resized drawing coordinates
             map boxes back to original drawing coordinates by / drawing_scale
         """
-
         original_w, original_h = drawing_image.size
 
         # Pattern is processed once.
@@ -315,6 +334,7 @@ class DinoPatternDetector:
             patch_size=self.patch_size,
             resize_option="resize",
         )
+
 
         pattern_feature = self.extract_features(pattern_wrapper)
         query_mask = pattern_wrapper.get_token_mask().to(self.device)
@@ -326,9 +346,11 @@ class DinoPatternDetector:
         all_scores = []
         all_meta = []
 
+        
         for drawing_scale in drawing_scales:
             # Resize original drawing directly.
             # Do not resize drawing_wrapper.image, because that may already be cropped / binarized.
+            start = time.time()
             scaled_w = max(1, int(round(original_w * drawing_scale)))
             scaled_h = max(1, int(round(original_h * drawing_scale)))
 
@@ -351,12 +373,14 @@ class DinoPatternDetector:
 
             drawing_feature = self.extract_features(curr_drawing_wrapper)
 
+            print(f"Extracted features for drawing scale {drawing_scale:.2f} in {time.time() - start:.2f} seconds")
+            start = time.time()
             heatmap = self.compute_similarity_heatmap(
                 drawing_features=drawing_feature,
                 query_features=pattern_feature,
-                drawing_mask=curr_drawing_wrapper.get_token_mask().to(self.device),
                 query_mask=query_mask,
             )
+            print(f"Computed heatmap for drawing scale {drawing_scale:.2f} in {time.time() - start:.2f} seconds")
 
             if heatmap is None:
                 continue
@@ -368,6 +392,7 @@ class DinoPatternDetector:
                     title=f"Drawing scale {drawing_scale:.2f}",
                 )
 
+            start = time.time()
             peak_kernel = max(
                 3,
                 int(min(q_grid_h, q_grid_w) // 2) * 2 + 1,
@@ -380,12 +405,13 @@ class DinoPatternDetector:
                 max_candidates=300,
                 peak_kernel_size=peak_kernel,
             )
-
+            print(f"Got {len(candidates)} candidates for drawing scale {drawing_scale:.2f} in {time.time() - start:.2f} seconds")
+            start = time.time()
             if debug:
                 print(f"Drawing scale: {drawing_scale}")
                 print(f"Drawing grid: {d_grid_w} x {d_grid_h}")
                 print(f"Query grid: {q_grid_w} x {q_grid_h}")
-                print(f"Candidates: {candidates}")
+                print(f"Candidates len: {len(candidates)}")
 
             for token_x, token_y, score in candidates:
                 # Coordinates in the resized drawing.
@@ -419,11 +445,14 @@ class DinoPatternDetector:
                     }
                 )
 
+        end = time.time()
+        print(f"Measure time: {end - start:.2f} seconds")
         keep = self.nms(
             all_boxes,
             all_scores,
             iou_threshold=nms_iou_threshold,
         )
+        print(f"Total candidates before NMS: {len(all_boxes)}, after NMS: {len(keep)}")
         keep = keep[:max_detections]
 
         detections = []
@@ -443,6 +472,7 @@ class DinoPatternDetector:
 
         detections = sorted(detections, key=lambda d: d["score"], reverse=True)
 
+        
         visualization = self.draw_detections(drawing_image, detections)
 
         return detections, visualization
@@ -457,7 +487,7 @@ class DinoPatternDetector:
         image = drawing_image.copy()
         draw = ImageDraw.Draw(image)
 
-        for det in detections:
+        for idx, det in enumerate(detections):
             x1, y1, x2, y2 = det["xyxy"]
             score = det["score"]
             drawing_scale = det.get("drawing_scale", 1.0)
@@ -468,30 +498,52 @@ class DinoPatternDetector:
                 width=box_width,
             )
 
-            label = f"{score:.3f}, ds={drawing_scale:.2f}"
-            text_y = max(0, y1 - 12)
-            draw.text((x1, text_y), label, fill=(255, 0, 0))
+            label = f"{score:.3f}\nds={drawing_scale:.2f}\nidx={idx}"
+            text_y = max(0, y1 + 6)
+            draw.text((x1 + 4, text_y), label, fill=(255, 0, 0))
 
         return image
 
-import time
-
 if __name__ == "__main__":
-    detector = DinoPatternDetector(model_name="dinov2_vits14", device="cuda")
+    detector = DinoPatternDetector(model_name="dinov2_vits14", device=DEVICE)
 
-    pattern_image = Image.open("examples/pattern3.png")
+    pattern_image = Image.open(f"examples/pattern{TEST_PATTERN_NO}.png")
     drawing_image = Image.open("examples/drawing.png")
+
+    image_wrapper = ImageWrapper(resize_with_scale(drawing_image, scale=0.22), patch_size=14, resize_option="resize")
+
+    scaled_roi_coords, _ = find_roi(
+        features_np=detector.extract_features(image_wrapper).cpu().numpy(),
+        image_size=image_wrapper.image_size,
+        patch_size=detector.patch_size,
+        n_clusters=3,
+        min_component_area=8,
+        keep_top_k_components=None,
+        margin_tokens=0,
+        connectivity=4,
+    )
+
+    roi_coords = (np.array(scaled_roi_coords) / 0.22).astype(int).tolist()
+    efficiency = (roi_coords[2] - roi_coords[0]) * (roi_coords[3] - roi_coords[1]) / (drawing_image.size[0] * drawing_image.size[1])
+    print(f"ROI efficiency: {efficiency:.2f}")
+
+    roi = drawing_image.crop(roi_coords)
+    #roi = drawing_image
+
+    print(f"ROI coords: {roi_coords}")
+
+    roi.save("roi.png")
+
     start_time = time.time()
     detections, viz = detector.detect(
         pattern_image=pattern_image,
-        drawing_image=drawing_image,
-        drawing_scales=[2.2],
-        threshold_percentile=98.0,
+        drawing_image=roi,
+        drawing_scales=SCALE_LIST,
+        threshold_percentile=90.0,
         nms_iou_threshold=0.05,
-        max_detections=30,
+        max_detections=8,
         debug=True,
     )
     end_time = time.time()
     print(f"Detection time: {end_time - start_time:.2f} seconds")
     viz.save("output.png")
-    viz.show()

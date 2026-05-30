@@ -7,6 +7,10 @@ from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
 from torchvision import transforms
 
+import cv2
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import normalize
+
 def _to_pil_rgb(
     image: Union[str, np.ndarray, Image.Image],
 ) -> Image.Image:
@@ -103,3 +107,182 @@ def save_heatmap(
     plt.savefig(save_path, dpi=200)
     print(f"Saved heatmap to {save_path}")
     plt.close()
+
+
+def display_overlay(mask: np.ndarray, background: Image.Image, alpha=0.5, output_path="overlay.png"):
+    """ overplay is the mask, background is the original image"""
+
+    # Convert to RGBA
+    overlay = Image.fromarray(mask).convert("RGBA")
+    background = background.convert("RGBA")
+
+    # Make white transparent, black -> blue
+    pixels = overlay.load()
+    for y in range(overlay.height):
+        for x in range(overlay.width):
+            r, g, b, a = pixels[x, y]
+
+            # assuming binary image: black foreground, white background
+            if r < 128:  # black
+                pixels[x, y] = (0, 0, 0, 0)  # fully transparent
+            else:        # white
+                pixels[x, y] = (0, 0, 255, 128)  # semi-transparent blue
+
+    # Scale overlay up to match background size
+    overlay = overlay.resize(background.size, Image.Resampling.NEAREST)
+
+    # Put overlay on top
+    result = Image.alpha_composite(background, overlay)
+
+    result.save(output_path)
+    return result
+
+
+def find_roi(
+    features_np: np.ndarray,
+    image_size: tuple, #[w, h]
+    patch_size=14,
+    n_clusters=3,
+    center_xy=None,
+    min_component_area=5,
+    keep_top_k_components=None,
+    margin_tokens=0,
+    l2_normalize=True,
+    connectivity=8,
+) -> Tuple[Tuple[int, int, int, int], Dict]:
+    """
+    KMeans center-cluster ROI, but ignore outlier islands.
+
+    Steps:
+    1. KMeans directly on DINO features
+    2. Get center token's label
+    3. Make mask of all tokens with that label
+    4. Remove small connected components
+    5. Take bbox of remaining tokens
+    6. Convert bbox back to image coordinates by * patch_size
+
+    Args:
+        features: [H_tokens, W_tokens, D]
+        image: PIL.Image
+        patch_size: usually 14 for DINOv2 ViT/14
+        n_clusters: KMeans cluster count
+        center_xy: optional pixel-space point (x, y), default image center
+        min_component_area: remove connected components smaller than this token count
+        keep_top_k_components:
+            - None: keep all components >= min_component_area
+            - int: keep only top-k largest valid components
+        margin_tokens: expand bbox by this many tokens
+        l2_normalize: normalize features before KMeans
+
+    Returns:
+        roi: (x1, y1, x2, y2)
+        debug: dict
+    """
+
+    h_tokens, w_tokens, d = features_np.shape
+    flat_features = features_np.reshape(-1, d).astype(np.float32)
+
+    if l2_normalize:
+        flat_features = normalize(flat_features, norm="l2", axis=1)
+
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=0,
+        n_init=10,
+    )
+
+    flat_labels = kmeans.fit_predict(flat_features)
+    labels = flat_labels.reshape(h_tokens, w_tokens)
+
+    # Center token
+    if center_xy is None:
+        cx_token = w_tokens // 2
+        cy_token = h_tokens // 2
+    else:
+        cx, cy = center_xy
+        cx_token = int(cx / patch_size)
+        cy_token = int(cy / patch_size)
+        cx_token = np.clip(cx_token, 0, w_tokens - 1)
+        cy_token = np.clip(cy_token, 0, h_tokens - 1)
+
+    center_label = labels[cy_token, cx_token]
+
+    # Mask of selected cluster
+    cluster_mask = (labels == center_label).astype(np.uint8)
+
+    # Connected components on token grid
+    num_cc, cc_map, stats, _ = cv2.connectedComponentsWithStats(
+        cluster_mask,
+        connectivity=connectivity,
+    )
+
+    valid_components = []
+
+    for cc_id in range(1, num_cc):
+        area = stats[cc_id, cv2.CC_STAT_AREA]
+
+        if area >= min_component_area:
+            valid_components.append((cc_id, area))
+
+    # Fallback: if filtering removed everything, use original cluster mask
+    if len(valid_components) == 0:
+        clean_mask = cluster_mask.copy()
+    else:
+        valid_components = sorted(
+            valid_components,
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        if keep_top_k_components is not None:
+            valid_components = valid_components[:keep_top_k_components]
+
+        clean_mask = np.zeros_like(cluster_mask)
+
+        for cc_id, area in valid_components:
+            clean_mask[cc_map == cc_id] = 1
+
+    ys, xs = np.where(clean_mask > 0)
+
+    if len(xs) == 0 or len(ys) == 0:
+        return (0, 0, image_size[0], image_size[1]), {
+            "labels": labels,
+            "center_label": center_label,
+            "cluster_mask": cluster_mask,
+            "clean_mask": clean_mask,
+            "center_token": (cx_token, cy_token),
+        }
+
+    x_min_token = max(0, xs.min() - margin_tokens)
+    x_max_token = min(w_tokens - 1, xs.max() + margin_tokens)
+    y_min_token = max(0, ys.min() - margin_tokens)
+    y_max_token = min(h_tokens - 1, ys.max() + margin_tokens)
+
+    x1 = int(x_min_token * patch_size)
+    y1 = int(y_min_token * patch_size)
+    x2 = int((x_max_token + 1) * patch_size)
+    y2 = int((y_max_token + 1) * patch_size)
+
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(image_size[0], x2)
+    y2 = min(image_size[1], y2)
+
+    roi = (x1, y1, x2, y2)
+
+    debug = {
+        "labels": labels,
+        "center_label": center_label,
+        "cluster_mask": cluster_mask,
+        "clean_mask": clean_mask,
+        "center_token": (cx_token, cy_token),
+        "token_bbox": (
+            x_min_token,
+            y_min_token,
+            x_max_token,
+            y_max_token,
+        ),
+        "valid_components": valid_components,
+    }
+
+    return roi, debug
