@@ -3,7 +3,7 @@ import os
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
 from torchvision import transforms
 
@@ -49,7 +49,13 @@ def turn_to_binary(image: Image.Image, threshold: int = 220) -> Image.Image:
     binary = gray.point(lambda x: 255 if x > threshold else 0)
     return binary
 
-def fit_to_patch_grid(image: Image.Image, patch_size: int, option: str = "crop") -> tuple[Image.Image, Tuple[int, int]]:
+def fit_to_patch_grid(
+    image: Image.Image,
+    patch_size: int,
+    option: str = "crop",
+    make_square: bool = False,
+    pad_value: int = 255, # white
+) -> tuple[Image.Image, Tuple[int, int], bool]:
     new_w = math.floor(image.width / patch_size) * patch_size
     new_h = math.floor(image.height / patch_size) * patch_size
 
@@ -65,8 +71,33 @@ def fit_to_patch_grid(image: Image.Image, patch_size: int, option: str = "crop")
     else:
         raise ValueError(f"Invalid option: {option}. Must be 'crop' or 'resize'.")
     
+    is_originally_square = (new_w == new_h)
+    # 2. Pad smaller side to make square
+    if make_square and is_originally_square == False:
+        is_originally_square = False
+        w, h = image.size
+        side = max(w, h)
+
+        pad_w = side - w
+        pad_h = side - h
+
+        # Because w and h are already multiples of patch_size,
+        # pad_w and pad_h are also multiples of patch_size.
+        # We distribute padding in whole-patch units.
+        right = (pad_w // patch_size // 2) * patch_size
+        left = pad_w - right
+
+        top = (pad_h // patch_size // 2) * patch_size
+        bottom = pad_h - top
+
+        image = ImageOps.expand(
+            image,
+            border=(left, top, right, bottom),
+            fill=pad_value,
+        )
+    
     grid_size = (image.size[0] // patch_size, image.size[1] // patch_size) # [w, h]
-    return image, grid_size
+    return image, grid_size, is_originally_square
 
 def resize_with_scale(image: Image.Image, scale: float) -> Image.Image:
     w, h = image.size
