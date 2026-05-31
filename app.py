@@ -16,6 +16,11 @@ from utils import find_roi, resize_with_scale
 DEFAULT_MODEL_NAME = "dinov2_vits14"
 DEFAULT_DEVICE = None
 ROI_PREVIEW_SCALE = 0.22
+EXAMPLES_BASE_URL = "https://github.com/votaquangnhat/sotatek-assessment/blob/main/examples"
+
+
+def _example_url(filename: str) -> str:
+    return f"{EXAMPLES_BASE_URL}/{filename}?raw=1"
 
 
 def _default_scale_text() -> str:
@@ -201,9 +206,9 @@ def build_demo() -> gr.Blocks:
             with gr.Column(scale=1):
                 gr.Examples(
                     examples=[
-                        ["examples/pattern1.png", "examples/drawing.png"],
-                        #["examples/pattern2.png", "examples/drawing.png"],
-                        ["examples/pattern3.png", "examples/drawing.png"],
+                        [_example_url("pattern1.png"), _example_url("drawing.png")],
+                        # [_example_url("pattern2.png"), _example_url("drawing.png")],
+                        [_example_url("pattern3.png"), _example_url("drawing.png")],
                     ],
                     inputs=[pattern_input, drawing_input],
                     label="Examples",
